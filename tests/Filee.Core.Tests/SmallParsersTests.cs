@@ -31,6 +31,10 @@ public class FormatRegistryTests
     [InlineData("anim.apng", "apng")]
     [InlineData("scan.dicom", "dcm")]
     [InlineData("texture.rgb", "sgi")]
+    [InlineData("archive.001", "split")]
+    [InlineData("archive.7z.001", "split")]
+    [InlineData("archive.zip.001", "split")]
+    [InlineData("archive.tar.001", "split")]
     public void Detects_formats(string path, string id) => Assert.Equal(id, FormatRegistry.Detect(path)?.Id);
 
     [Fact]
@@ -91,6 +95,17 @@ public class BuiltInDataTests
             Assert.All(group.SubPresetIds, id => Assert.False(presets[id].IsGroup, id));
         }
         Assert.DoesNotContain(BuiltInData.CreateProfiles(), p => p.PresetIds.Any(id => presets[id].IsGroup));
+    }
+
+    [Fact]
+    public void Only_compress_into_one_archive_presets_take_folders()
+    {
+        var presets = BuiltInData.CreatePresets().ToDictionary(p => p.Id);
+        Assert.True(presets["zip-all"].PacksIntoOneArchive);
+        Assert.False(presets["to-zip"].PacksIntoOneArchive); // one archive for each file
+        Assert.False(presets["extract"].PacksIntoOneArchive); // a folder is no archive to pack into
+        Assert.False(presets["to-pdf"].PacksIntoOneArchive);
+        Assert.False(new Preset { TargetFormat = "pdf", Archive = { CombineIntoOne = true } }.PacksIntoOneArchive);
     }
 
     [Fact]

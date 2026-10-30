@@ -32,9 +32,32 @@ public enum ConflictPolicy
 /// <summary>Output placement and naming rules.</summary>
 public sealed class OutputRule
 {
+    /// <summary>A name this version doesn't know (from a newer Filee) reads as <see cref="OutputLocation.Default"/>.</summary>
+    [System.Text.Json.Serialization.JsonConverter(typeof(LenientEnumJsonConverter<OutputLocation>))]
     public OutputLocation Location { get; set; } = OutputLocation.Default;
 
+    /// <summary>
+    /// "Ask every time" (#521): the donut asks where to save first, once per batch, in the source's folder
+    /// (<see cref="AskedLocation"/>). Where nothing can ask (the command line, files from a browser, other tools),
+    /// <see cref="Location"/> applies. A bool of its own, so a Filee from before it keeps the preset and uses Location.
+    /// </summary>
+    public bool AskEveryTime { get; set; }
+
+    /// <summary>
+    /// The one path the user picked and confirmed in the save dialog: it may replace a file there whatever
+    /// <see cref="Conflict"/> says. Set per job, never saved with a preset.
+    /// </summary>
+    [System.Text.Json.Serialization.JsonIgnore]
+    public string? ConfirmedPath { get; set; }
+
     public string SubfolderName { get; set; } = "converted";
+
+    /// <summary>
+    /// With <see cref="OutputLocation.Subfolder"/>: only a source that becomes several files (a PDF split into pages)
+    /// gets the subfolder; one that becomes a single file is saved next to the source, so a one-page PDF doesn't end up
+    /// alone in a folder of its own.
+    /// </summary>
+    public bool SubfolderOnlyForSeveralFiles { get; set; }
 
     public string CustomFolder { get; set; } = "";
 
@@ -63,6 +86,34 @@ public sealed class OutputRule
     /// by when they were taken. Not for merged PDFs or combined archives, which come from many files.
     /// </summary>
     public bool KeepDates { get; set; }
+
+    /// <summary>
+    /// The folder "next to the source" means for this job, instead of the source's own: files dragged from a browser
+    /// are saved there (or, when only the converted file is kept, into a work folder that is deleted afterwards).
+    /// Set per job, never saved with a preset.
+    /// </summary>
+    [System.Text.Json.Serialization.JsonIgnore]
+    public string? SourceFolder { get; set; }
+
+    /// <summary>
+    /// Pack what a conversion writes for one file (a Shapefile's .shp, .shx, .dbf, .prj and .cpg, or a single file)
+    /// into one ZIP named by the rule, instead of leaving the files themselves. The ZIP is the only output.
+    /// </summary>
+    public bool ZipResult { get; set; }
+
+    /// <summary>
+    /// "Compress" presets: when a file that keeps its format doesn't get smaller, the output is a copy of the source
+    /// instead, with a notice. A result in another format is always kept.
+    /// </summary>
+    public bool OnlyIfSmaller { get; set; }
+
+    /// <summary>
+    /// The result takes the original's place and the original goes to the Recycle Bin / Trash (#332): only when the
+    /// result has the source's format, only after it is complete, never for watch folders or files from a browser.
+    /// When the original can't be moved there (a network drive, a file still open elsewhere, no Trash), it stays and
+    /// the result is saved as usual, with a note saying why.
+    /// </summary>
+    public bool ReplaceOriginal { get; set; }
 
     public OutputRule Clone()
     {

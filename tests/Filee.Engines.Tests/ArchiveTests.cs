@@ -56,6 +56,7 @@ public class ArchiveTests(EngineFixture fx) : IClassFixture<EngineFixture>
     [InlineData("egg")]
     [InlineData("lz")]
     [InlineData("tlz")]
+    [InlineData("split")]
     public void Every_readable_archive_converts_in_one_step(string from)
     {
         var planner = fx.Catalog.CreatePlanner(["archive"]);
@@ -190,6 +191,26 @@ public class ArchiveTests(EngineFixture fx) : IClassFixture<EngineFixture>
         var folder = (await ConvertOkAsync(tgz, Extract)).Outputs.Single();
         Assert.Equal(Path.Combine(dir, "backup"), folder);
         Assert.Equal(Snapshot(tree), Snapshot(folder)); // files, not a lone backup.tar
+    }
+
+    [Fact]
+    public async Task Split_archive_001_extracts_all_volumes()
+    {
+        SkipWithout7Zip();
+        var dir = fx.NewFolder();
+        var content = "This is a split multi-part archive test payload."u8.ToArray();
+        var file = Path.Combine(dir, "document.txt");
+        await File.WriteAllBytesAsync(file, content, Ct);
+        var split7z = Path.Combine(dir, "split_archive.7z");
+        await Run7zAsync("a", "-t7z", "-v20b", split7z, file);
+        File.Delete(file);
+
+        var firstPart = Path.Combine(dir, "split_archive.7z.001");
+        Assert.True(File.Exists(firstPart));
+        Assert.True(File.Exists(Path.Combine(dir, "split_archive.7z.002")));
+
+        var folder = (await ConvertOkAsync(firstPart, Extract)).Outputs.Single();
+        Assert.Equal(content, await File.ReadAllBytesAsync(Path.Combine(folder, "document.txt"), Ct));
     }
 
     [Fact]
@@ -603,5 +624,54 @@ public class ArchiveTests(EngineFixture fx) : IClassFixture<EngineFixture>
         using var ms = new MemoryStream();
         stream.CopyTo(ms);
         return ms.ToArray();
+    }
+
+    // ───────────────────────── ANSYS Workbench archives (issue #294) ─────────────────────────
+
+    [Fact]
+    public async Task A_workbench_wbpz_archive_keeps_every_entry_when_converted_to_zip()
+    {
+        SkipWithout7Zip();
+        var input = Path.Combine(fx.NewFolder(), "project.wbpz");
+        var expected = new Dictionary<string, byte[]>
+        {
+            ["project.wbpj"] = Encoding.UTF8.GetBytes("<?xml version=\"1.0\"?><Project name=\"Archive payload\"/>"),
+            ["project_files/dp0/SYS/MECH/model.dat"] = Enumerable.Range(0, 256).Select(i => (byte)i).ToArray(),
+            ["user_files/ملاحظات.txt"] = Encoding.UTF8.GetBytes("مرحبا 中文 한국어\n"),
+        };
+        using (var archive = ZipFile.Open(input, ZipArchiveMode.Create))
+        {
+            foreach (var (name, bytes) in expected)
+            {
+                using var entry = archive.CreateEntry(name).Open();
+                entry.Write(bytes);
+            }
+            archive.CreateEntry("project_files/empty/");
+        }
+
+        var job = await fx.ConvertAsync([input], new Preset { TargetFormat = "zip" });
+
+        Assert.Equal(JobState.Completed, job.State);
+        using var output = ZipFile.OpenRead(Assert.Single(job.Outputs));
+        Assert.Equal(expected.Keys.Order(), output.Entries.Where(e => !e.FullName.EndsWith('/')).Select(e => e.FullName).Order());
+        foreach (var (name, bytes) in expected)
+        {
+            using var entry = output.GetEntry(name)!.Open();
+            using var data = new MemoryStream();
+            entry.CopyTo(data);
+            Assert.Equal(bytes, data.ToArray());
+        }
+        Assert.NotNull(output.GetEntry("project_files/empty/"));
+    }
+
+    [Fact]
+    public async Task A_wbpz_that_is_no_archive_fails()
+    {
+        SkipWithout7Zip();
+        var input = Path.Combine(fx.NewFolder(), "invalid.wbpz");
+        await File.WriteAllTextAsync(input, "This is not an archive.", TestContext.Current.CancellationToken);
+        var job = await fx.ConvertAsync([input], new Preset { TargetFormat = "zip" });
+        Assert.Equal(JobState.Failed, job.State);
+        Assert.Empty(job.Outputs);
     }
 }

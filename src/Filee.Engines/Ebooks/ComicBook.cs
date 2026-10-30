@@ -5,6 +5,8 @@
 
 using System.IO.Compression;
 using Filee.Core.Conversion;
+using Filee.Core.Platform;
+using Filee.Engines.Pdf;
 using ImageMagick;
 using PdfSharp.Drawing;
 using PdfSharp.Pdf;
@@ -114,8 +116,9 @@ internal static class ComicBook
         {
             cancellationToken.ThrowIfCancellationRequested();
             // JPEG and PNG go in as they are (PDFsharp embeds JPEG data without re-encoding); others become one of them.
-            if (EbookFiles.CommonImage(pages[i], converted, gifAndSvg: false) is not ({ } file, _))
+            if (EbookFiles.CommonImage(pages[i], converted, gifAndSvg: false) is not ({ } common, _))
                 continue;
+            var file = PdfPictures.Readable(common, converted);
             var info = new MagickImageInfo(file);
             var dpi = info.Density is { X: >= 36 } density ? density.Units == DensityUnit.PixelsPerCentimeter ? density.X * 2.54 : density.X : 96;
             using var image = XImage.FromFile(file);
@@ -173,42 +176,5 @@ internal static class ComicBook
             progress?.Report(0.9 * pages.Count / Math.Max(1, pageNumbers.Count));
         }
         return pages;
-    }
-}
-
-/// <summary>Compares names the way people number pages: digit runs by value ("p2" &lt; "p10"), case-insensitively.</summary>
-internal sealed class NaturalComparer : IComparer<string>
-{
-    public static readonly NaturalComparer Instance = new();
-
-    public int Compare(string? x, string? y)
-    {
-        if (x is null || y is null)
-            return string.CompareOrdinal(x, y);
-        int i = 0, j = 0;
-        while (i < x.Length && j < y.Length)
-        {
-            if (char.IsAsciiDigit(x[i]) && char.IsAsciiDigit(y[j]))
-            {
-                var startX = i;
-                var startY = j;
-                while (i < x.Length && char.IsAsciiDigit(x[i]))
-                    i++;
-                while (j < y.Length && char.IsAsciiDigit(y[j]))
-                    j++;
-                var numberX = x[startX..i].TrimStart('0');
-                var numberY = y[startY..j].TrimStart('0');
-                var byValue = numberX.Length != numberY.Length ? numberX.Length.CompareTo(numberY.Length) : string.CompareOrdinal(numberX, numberY);
-                if (byValue != 0)
-                    return byValue;
-                continue;
-            }
-            var byChar = char.ToLowerInvariant(x[i]).CompareTo(char.ToLowerInvariant(y[j]));
-            if (byChar != 0)
-                return byChar;
-            i++;
-            j++;
-        }
-        return (x.Length - i).CompareTo(y.Length - j);
     }
 }

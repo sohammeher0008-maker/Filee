@@ -1,8 +1,12 @@
 // Builds small PDF files for the PDF reader tests with PdfPig's writer: text in the standard 14 fonts (every PDF
 // reader has them, so no font file is needed and the tests run on machines without Windows fonts), wrapped
-// paragraphs, colours, pictures, links and several pages. PDFsharp adds password protection to a finished file.
+// paragraphs, colours, pictures, links, lines and filled bars (ruled tables) and several pages. PDFsharp adds password
+// protection to a finished file, and turns or crops its pages as printer drivers and viewers do.
 
+using System.Globalization;
+using System.Text;
 using ImageMagick;
+using PdfSharp.Drawing;
 using PdfSharp.Pdf.IO;
 using UglyToad.PdfPig.Core;
 using UglyToad.PdfPig.Fonts.Standard14Fonts;
@@ -101,6 +105,24 @@ internal sealed class PdfBuilder
         return this;
     }
 
+    /// <summary>A stroked straight line from (x1, y1) to (x2, y2).</summary>
+    public PdfBuilder Rule(double x1, double y1, double x2, double y2, double width = 0.5)
+    {
+        Page.DrawLine(new PdfPoint(x1, _height - y1), new PdfPoint(x2, _height - y2), width);
+        return this;
+    }
+
+    /// <summary>A filled rectangle (a thick rule drawn as a bar, or shading) with its top-left corner at (x, y).</summary>
+    public PdfBuilder Bar(double x, double y, double width, double height, (byte R, byte G, byte B)? color = null)
+    {
+        var (r, g, b) = color ?? ((byte)0, (byte)0, (byte)0);
+        Page.SetTextAndFillColor(r, g, b);
+        Page.SetStrokeColor(r, g, b);
+        Page.DrawRectangle(new PdfPoint(x, _height - y - height), width, height, 0.1, fill: true);
+        Page.ResetColor();
+        return this;
+    }
+
     /// <summary>A web link over the rectangle.</summary>
     public PdfBuilder Link(string url, double x, double y, double width, double height)
     {
@@ -120,6 +142,38 @@ internal sealed class PdfBuilder
     {
         File.WriteAllBytes(path, _builder.Build());
         return path;
+    }
+
+    /// <summary>
+    /// Rewrites every page the way printer drivers (PScript5, Acrobat Distiller) write a landscape page: a portrait
+    /// page whose content is drawn turned by 90°, and /Rotate <paramref name="rotate"/> (90 or 270) turns it back, so
+    /// it is shown as before. Without <paramref name="drawTurned"/> only /Rotate is set, as a viewer turns a page (its
+    /// text then runs sideways). With <paramref name="rotate"/> 0 the page stays as it is. A crop box cuts
+    /// <paramref name="inset"/> points off every side of the page.
+    /// </summary>
+    public static void Turn(string path, int rotate, bool drawTurned = true, double inset = 0)
+    {
+        using var document = PdfReader.Open(path, PdfDocumentOpenMode.Modify);
+        foreach (var page in document.Pages)
+        {
+            var box = page.Elements.GetRectangle("/MediaBox");
+            var (width, height) = (box.Width, box.Height);
+            if (rotate != 0 && drawTurned)
+            {
+                var turn = rotate == 90
+                    ? string.Create(CultureInfo.InvariantCulture, $"0 1 -1 0 {height} 0 cm")
+                    : string.Create(CultureInfo.InvariantCulture, $"0 -1 1 0 0 {width} cm");
+                page.Contents.PrependContent().CreateStream(Encoding.ASCII.GetBytes($"q {turn}\n"));
+                page.Contents.AppendContent().CreateStream("Q\n"u8.ToArray());
+                (width, height) = (height, width);
+                page.Elements.SetRectangle("/MediaBox", new PdfSharp.Pdf.PdfRectangle(new XPoint(0, 0), new XPoint(width, height)));
+            }
+            if (rotate != 0)
+                page.Elements.SetInteger("/Rotate", rotate);
+            if (inset > 0)
+                page.Elements.SetRectangle("/CropBox", new PdfSharp.Pdf.PdfRectangle(new XPoint(inset, inset), new XPoint(width - inset, height - inset)));
+        }
+        document.Save(path);
     }
 
     /// <summary>Encrypts a PDF with a password needed to open it (PDFsharp, no fonts involved).</summary>

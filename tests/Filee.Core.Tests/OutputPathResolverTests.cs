@@ -33,6 +33,12 @@ public class OutputPathResolverTests
         Assert.Equal("tar.gz", FormatRegistry.ExtensionOf(source));
         Assert.Equal("gz", FormatRegistry.ExtensionOf("notes.txt.gz"));
         Assert.Equal("notes.txt", FormatRegistry.NameWithoutExtension("notes.txt.gz"));
+        Assert.Equal("split", FormatRegistry.Detect("archive.7z.001")!.Id);
+        Assert.Equal("7z.001", FormatRegistry.ExtensionOf("archive.7z.001"));
+        Assert.Equal("archive", FormatRegistry.NameWithoutExtension("archive.7z.001"));
+        Assert.Equal("split", FormatRegistry.Detect("archive.001")!.Id);
+        Assert.Equal("001", FormatRegistry.ExtensionOf("archive.001"));
+        Assert.Equal("archive", FormatRegistry.NameWithoutExtension("archive.001"));
         Assert.Equal("mp4", FormatRegistry.Detect("clip.MP4")!.Id);
         Assert.Null(FormatRegistry.Detect("README"));
     }
@@ -47,6 +53,17 @@ public class OutputPathResolverTests
         var path = OutputPathResolver.Resolve(new OutputRule(), Tokens(source), "", p => File.Exists(p) || Directory.Exists(p));
 
         Assert.Equal(Path.Combine(dir.Path, "photos (2)"), path);
+    }
+
+    [Fact]
+    public void A_folder_ending_in_a_separator_is_named_and_placed_like_the_folder()
+    {
+        using var dir = new TempDir();
+        var folder = Directory.CreateDirectory(Path.Combine(dir.Path, "Photos")).FullName;
+
+        var path = OutputPathResolver.Resolve(new OutputRule(), Tokens(folder + Path.DirectorySeparatorChar), "zip", File.Exists);
+
+        Assert.Equal(Path.Combine(dir.Path, "Photos.zip"), path);
     }
 
     [Fact]
@@ -93,6 +110,15 @@ public class OutputPathResolverTests
         var path = OutputPathResolver.Resolve(rule, Tokens(Path.Combine("C:", "x", "a.jpg"), 3), "png", _ => false);
 
         Assert.Equal("a_PNG_20260930_3__.png", Path.GetFileName(path));
+    }
+
+    [Fact]
+    public void Tokens_in_the_source_name_are_kept_as_they_are()
+    {
+        var rule = new OutputRule { FileNamePattern = "{name}_{index}" };
+        var path = OutputPathResolver.Resolve(rule, Tokens(Path.Combine("C:", "x", "Minutes {date} {Index}.docx"), 3), "pdf", _ => false);
+
+        Assert.Equal("Minutes {date} {Index}_3.pdf", Path.GetFileName(path));
     }
 
     [Fact]

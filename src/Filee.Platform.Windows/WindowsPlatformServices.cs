@@ -40,6 +40,7 @@ public sealed class WindowsPlatformServices : IPlatformServices
         "OneCommander",
         "Q-Dir",
         "FreeCommander",
+        "FPilot",         // File Pilot (#633)
     };
 
     public void RaiseTopmost(nint windowHandle)
@@ -49,9 +50,13 @@ public sealed class WindowsPlatformServices : IPlatformServices
                 NativeMethods.SWP_NOMOVE | NativeMethods.SWP_NOSIZE | NativeMethods.SWP_NOACTIVATE | NativeMethods.SWP_NOOWNERZORDER);
     }
 
+    public TrashRefusal? MoveToTrash(string path) => RecycleBin.Move(path);
+
     public bool IsFileManagerAt(int x, int y)
     {
-        var root = RootWindowAt(x, y);
+        // Over a window the desktop owns (a desktop icon layer), a gesture is in the desktop's scope. Only here: the
+        // process name (ProcessNameAt, the excluded apps list) stays the layer's own, so the layer can be excluded.
+        var root = DesktopOrSelf(RootWindowAt(x, y));
         if (root == 0)
             return false;
         return IsFileManager(NativeMethods.ClassNameOf(root), ProcessNameOf(root));
@@ -68,8 +73,44 @@ public sealed class WindowsPlatformServices : IPlatformServices
         return root == 0 ? null : ProcessNameOf(root);
     }
 
+    public ForegroundWindowInfo? GetForegroundWindow()
+    {
+        var root = ForegroundRoot();
+        if (root == 0)
+            return null;
+        var process = ProcessNameOf(root);
+        return new ForegroundWindowInfo(process, IsFileManager(NativeMethods.ClassNameOf(root), process));
+    }
+
+    /// <summary>True for the desktop's window classes: its icons are not among Shell.Application's windows.</summary>
+    internal static bool IsDesktop(string? windowClass) => windowClass is "Progman" or "WorkerW";
+
     /// <summary>
-    /// Reads the selection of the foreground Explorer window through the Shell automation object.
+    /// True when the end of a window's owner chain (<paramref name="rootOwner"/>) is another window and the desktop.
+    /// Desktop icon layers (apps that hide Explorer's icon view and draw the icons themselves) cover the screen with a
+    /// window owned by the shell's desktop window, so a mouse gesture over them acts as on the desktop: the files
+    /// arrive through the OLE drag the layer starts. The selection shortcut is left out on purpose: it would read
+    /// Explorer's hidden desktop view, and nothing shows that a given layer keeps that view's selection in step.
+    /// </summary>
+    internal static bool StandsForDesktop(nint window, nint rootOwner, string? rootOwnerClass) =>
+        rootOwner != 0 && rootOwner != window && IsDesktop(rootOwnerClass);
+
+    /// <summary>The desktop for a top-level window it owns (see <see cref="StandsForDesktop"/>), else the window.</summary>
+    private static nint DesktopOrSelf(nint window)
+    {
+        if (window == 0)
+            return 0;
+        var owner = NativeMethods.GetAncestor(window, NativeMethods.GA_ROOTOWNER);
+        return StandsForDesktop(window, owner, NativeMethods.ClassNameOf(owner)) ? owner : window;
+    }
+
+    public string? ShortcutTarget(string path) => ShellLinks.TargetOf(path);
+
+    public string DownloadsFolder => KnownFolders.Downloads
+        ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads");
+
+    /// <summary>
+    /// Reads the selection of the foreground Explorer window, or of the desktop, through the Shell automation objects.
     /// Must be called on an STA thread (the Avalonia UI thread is STA).
     /// </summary>
     public IReadOnlyList<string> GetFileManagerSelection()
@@ -77,7 +118,52 @@ public sealed class WindowsPlatformServices : IPlatformServices
         var foreground = NativeMethods.GetForegroundWindow();
         if (foreground == 0)
             return [];
+        return IsDesktop(NativeMethods.ClassNameOf(ForegroundRoot())) ? DesktopSelection() : SelectionOf(foreground);
+    }
 
+    /// <summary>The files selected on the desktop (#450).</summary>
+    internal static IReadOnlyList<string> DesktopSelection()
+    {
+        try
+        {
+            return DesktopShellView.Use(view =>
+            {
+                dynamic folderView = view;
+                dynamic items = folderView.SelectedItems();
+                try
+                {
+                    return ExistingFiles((object)items);
+                }
+                finally
+                {
+                    Marshal.FinalReleaseComObject((object)items);
+                }
+            });
+        }
+        catch (Exception ex) when (ex is COMException or InvalidOperationException or InvalidCastException
+                                       or Microsoft.CSharp.RuntimeBinder.RuntimeBinderException)
+        {
+            // No Explorer desktop (another shell, Explorer restarting): nothing selected to read.
+            return [];
+        }
+    }
+
+    /// <summary>The paths of a shell item collection that are files on disk.</summary>
+    private static List<string> ExistingFiles(object items)
+    {
+        var paths = new List<string>();
+        foreach (dynamic item in (dynamic)items)
+        {
+            string path = item.Path;
+            if (File.Exists(path))
+                paths.Add(path);
+        }
+        return paths;
+    }
+
+    /// <summary>The selected files of an Explorer window; with tabs, of its active tab (see <see cref="ExplorerTabs"/>).</summary>
+    internal static IReadOnlyList<string> SelectionOf(nint foreground)
+    {
         var type = Type.GetTypeFromProgID("Shell.Application");
         if (type is null)
             return [];
@@ -89,25 +175,39 @@ public sealed class WindowsPlatformServices : IPlatformServices
             dynamic windows = shell.Windows();
             int count = windows.Count;
 
-            // With Explorer tabs (Windows 11) several entries share one HWND. The active tab is the one
-            // that has a selection in practice, so take the first matching window with selected items.
+            // With Explorer tabs (Windows 11) every tab is an entry with the window's HWND: find the active one.
+            var activeTab = ExplorerTabs.ActiveTabOf(foreground);
+            var found = new List<object?>(count);
+            var entries = new List<ShellWindowEntry>(count);
             for (var i = 0; i < count; i++)
             {
-                dynamic? window = windows.Item(i);
+                object? window = null;
+                nint topLevel = 0, tab = 0;
+                try
+                {
+                    window = windows.Item(i);
+                    if (window is not null)
+                    {
+                        topLevel = (nint)(long)((dynamic)window).HWND;
+                        if (topLevel == foreground && activeTab != 0)
+                            tab = ExplorerTabs.TabOf(window);
+                    }
+                }
+                catch (COMException) { }
+                catch (Microsoft.CSharp.RuntimeBinder.RuntimeBinderException) { } // e.g. Internet Explorer windows
+                found.Add(window);
+                entries.Add(new ShellWindowEntry(topLevel, tab));
+            }
+
+            foreach (var i in ExplorerTabs.Candidates(entries, foreground, activeTab))
+            {
+                dynamic? window = found[i];
                 if (window is null)
                     continue;
                 try
                 {
-                    if ((nint)(long)window.HWND != foreground)
-                        continue;
                     dynamic items = window.Document.SelectedItems();
-                    var paths = new List<string>();
-                    foreach (dynamic item in items)
-                    {
-                        string path = item.Path;
-                        if (File.Exists(path))
-                            paths.Add(path);
-                    }
+                    var paths = ExistingFiles((object)items);
                     if (paths.Count > 0)
                         return paths;
                 }
@@ -128,13 +228,18 @@ public sealed class WindowsPlatformServices : IPlatformServices
 
     public string DescribeForegroundWindow()
     {
+        var root = ForegroundRoot();
+        return root == 0 ? "no foreground window" : $"{NativeMethods.ClassNameOf(root)} / {ProcessNameOf(root) ?? "?"}";
+    }
+
+    /// <summary>The top-level window of the foreground window, or 0 when there is none.</summary>
+    private static nint ForegroundRoot()
+    {
         var foreground = NativeMethods.GetForegroundWindow();
         if (foreground == 0)
-            return "no foreground window";
+            return 0;
         var root = NativeMethods.GetAncestor(foreground, NativeMethods.GA_ROOT);
-        if (root == 0)
-            root = foreground;
-        return $"{NativeMethods.ClassNameOf(root)} / {ProcessNameOf(root) ?? "?"}";
+        return root == 0 ? foreground : root;
     }
 
     public int SystemDragThreshold => Math.Max(2, NativeMethods.GetSystemMetrics(NativeMethods.SM_CXDRAG));
@@ -145,10 +250,26 @@ public sealed class WindowsPlatformServices : IPlatformServices
     public void SetStartWithSystem(bool enabled, string executablePath)
     {
         using var key = Registry.CurrentUser.CreateSubKey(RunKey);
-        if (enabled)
-            key.SetValue(AppName, $"\"{executablePath}\" --background");
-        else
+        if (!enabled)
+        {
             key.DeleteValue(AppName, throwOnMissingValue: false);
+            return;
+        }
+        var command = $"\"{executablePath}\" --background";
+        key.SetValue(AppName, command);
+        // Security software can take the entry away as soon as it is written (#450): read it back, so the switch
+        // says so instead of looking on while Filee doesn't start.
+        CheckStartupEntry(command, key.GetValue(AppName));
+    }
+
+    /// <summary>Throws <see cref="StartupEntryNotKeptException"/> unless <paramref name="readBack"/> is the command written.</summary>
+    internal static void CheckStartupEntry(string written, object? readBack)
+    {
+        if (readBack is string value && string.Equals(value, written, StringComparison.Ordinal))
+            return;
+        throw new StartupEntryNotKeptException(readBack is null
+            ? $"The startup entry HKCU\\{RunKey}\\{AppName} was gone right after it was written."
+            : $"The startup entry HKCU\\{RunKey}\\{AppName} reads \"{readBack}\" instead of \"{written}\".");
     }
 
     /// <summary>
@@ -242,6 +363,41 @@ public sealed class WindowsPlatformServices : IPlatformServices
     {
         var args = File.Exists(path) ? $"/select,\"{path}\"" : $"\"{path}\"";
         Process.Start(new ProcessStartInfo("explorer.exe", args) { UseShellExecute = true });
+    }
+
+    public void OpenFile(string path) =>
+        Process.Start(new ProcessStartInfo(Path.GetFullPath(path)) { UseShellExecute = true })?.Dispose();
+
+    public bool SupportsOpenWith => true;
+
+    /// <summary>
+    /// The dialog Explorer shows for "Open with → Choose another app". It blocks until it closes, so it runs on a
+    /// thread of its own (an STA one, as the shell expects), never on the UI thread.
+    /// </summary>
+    public void OpenWith(string path)
+    {
+        var file = Path.GetFullPath(path);
+        var thread = new Thread(() =>
+        {
+            var text = Marshal.StringToHGlobalUni(file);
+            try
+            {
+                var info = new NativeMethods.OPENASINFO
+                {
+                    File = text,
+                    Flags = NativeMethods.OAIF_ALLOW_REGISTRATION | NativeMethods.OAIF_REGISTER_EXT | NativeMethods.OAIF_EXEC,
+                };
+                // Cancelling returns an error HRESULT: nothing to report.
+                NativeMethods.SHOpenWithDialog(0, in info);
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(text);
+            }
+        })
+        { IsBackground = true, Name = "Open with" };
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
     }
 
     private static string SendToShortcutPath =>

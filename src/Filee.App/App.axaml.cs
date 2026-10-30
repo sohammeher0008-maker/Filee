@@ -36,7 +36,7 @@ public partial class App : Application
     {
         if (ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop)
         {
-            AppHost.Build();
+            AppHost.Build(preloadedStore: Program.PreloadedStore);
             Start(desktop);
         }
         base.OnFrameworkInitializationCompleted();
@@ -47,23 +47,40 @@ public partial class App : Application
 
     private void Start(IClassicDesktopStyleApplicationLifetime desktop)
     {
-        // macOS: "Convert with Filee" in Finder's right-click menu. Registered first, so a service picked while
-        // Filee wasn't running is delivered as soon as it starts.
-        if (OperatingSystem.IsMacOS())
-            Filee.Platform.MacOS.MacOSServicesProvider.Register(files =>
-                Dispatcher.UIThread.Post(() => HandleCommandLine(CommandLine.Parse(["--convert", .. files]))));
         var log = AppHost.Get<ILogger<App>>();
+        // macOS: "Convert with Filee" in Finder's right-click menu. Registered first, so a service picked while
+        // Filee wasn't running is delivered as soon as it starts. A request without files Filee can find (another
+        // file manager put its selection on the pasteboard in a form Filee doesn't read) is logged with what it held.
+        if (OperatingSystem.IsMacOS())
+            Filee.Platform.MacOS.MacOSServicesProvider.Register(
+                files => Dispatcher.UIThread.Post(() => HandleCommandLine(CommandLine.Parse(["--convert", .. files]))),
+                types => log.LogWarning("Convert with Filee was picked, but the request named no existing file; it held: {Types}",
+                    types.Count == 0 ? "nothing" : string.Join(", ", types)));
         // Exceptions in UI event handlers end Filee; write them down first (they are not marked handled).
         Dispatcher.UIThread.UnhandledException += (_, e) =>
             log.LogCritical(e.Exception, "Unhandled exception on the UI thread");
         var watchdog = new UiWatchdog(action => Dispatcher.UIThread.Post(action), AppHost.Get<ILogger<UiWatchdog>>());
         watchdog.Start();
         var store = AppHost.Get<UserDataStore>();
-        store.Load();
+        if (Program.PreloadedStore is null)
+            store.Load();
 
         var loc = AppHost.Get<LocalizationService>();
         loc.Attach(this);
         ApplySettings(store.Settings);
+        // Window zoom: set once here, not with the other settings, since the zoom saves itself (UiZoom) without
+        // raising SettingsChanged.
+        UiZoom.Configure(store.Settings.UiScale, scale =>
+        {
+            try
+            {
+                store.SaveUiScale(scale);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                log.LogWarning(ex, "Could not remember the window zoom");
+            }
+        });
         // Every engine's availability, checked once off the UI thread: the first donut or drop otherwise starts
         // every engine's check (FFmpeg -version, folder searches) on the UI thread and freezes it meanwhile.
         _ = AppHost.Get<ConverterCatalog>().CheckInBackgroundAsync();
@@ -105,16 +122,25 @@ public partial class App : Application
         };
         triggers.Start();
         log.LogInformation("Filee {Version} started", UpdateService.CurrentVersion);
+        // Which way the transparent windows (donut, toast) are drawn, for reports of one that isn't see-through (#269).
+        if (OperatingSystem.IsWindows())
+        {
+            log.LogInformation("{Rendering}", WindowsRendering.Describe(Environment.GetEnvironmentVariable(WindowsRendering.Variable)));
+            TransparentWindows.Watch(log);
+        }
         // macOS: ask for Accessibility with the system's own alert when the user opened Filee (not at sign-in) and
-        // a drag gesture is on. The home page keeps a reminder until it is given. Asked once the main window is up:
-        // asked earlier, the alert ends up behind it.
-        if (OperatingSystem.IsMacOS() && triggers.NeedsPermission && !Program.Options.Background
+        // a drag gesture is on, once ever (see ShouldAskForPermission). The home page keeps a reminder until it is
+        // given. Asked once the main window is up: asked earlier, the alert ends up behind it.
+        if (OperatingSystem.IsMacOS() && !Program.Options.Background
             && platform is Filee.Platform.MacOS.MacOSPlatformServices mac
-            && store.Settings.Triggers.Any(t => t.Enabled && t.Kind == TriggerKind.Drag))
+            && TriggerService.ShouldAskForPermission(store.Settings, triggers.NeedsPermission))
             DispatcherTimer.RunOnce(() =>
             {
-                if (OperatingSystem.IsMacOS() && triggers.NeedsPermission)
-                    mac.RequestAccessibilityPermission();
+                if (!OperatingSystem.IsMacOS() || !TriggerService.ShouldAskForPermission(store.Settings, triggers.NeedsPermission))
+                    return;
+                store.Settings.AccessibilityPromptShown = true;
+                store.SaveSettings();
+                mac.RequestAccessibilityPermission();
             }, TimeSpan.FromSeconds(1.5));
 
         store.SettingsChanged += (_, _) => ApplySettings(store.Settings);
@@ -123,6 +149,13 @@ public partial class App : Application
         AppHost.Get<WindowService>().EnsureToast();
         AppHost.Get<ConversionService>().FeedbackDue += (_, _) => AppHost.Get<WindowService>().ShowFeedbackNotice();
         AppHost.Get<WatchFolderService>().Start();
+        // Originals of files from a browser that a crash kept from being deleted ("Save only the converted file").
+        _ = Task.Run(() => Filee.Core.Web.WebDrop.DeleteStale(Filee.Core.Web.WebDrop.DefaultWorkRoot, TimeSpan.FromDays(1)));
+        // Likewise the work folders of conversions that never got to clean up after themselves.
+        _ = Task.Run(() => JobQueue.DeleteStaleWorkFolders(JobQueue.DefaultWorkRoot, TimeSpan.FromDays(1)));
+        // Leftover update workspaces from cancelled or failed in-app updates (Linux only).
+        if (OperatingSystem.IsLinux())
+            _ = Task.Run(() => UpdateService.DeleteStaleWorkspaces());
         // Once LibreOffice is installed: prepare its profiles while the user isn't converting yet.
         AppHost.Get<EngineDownloadService>().WarmUpInBackground(TimeSpan.FromSeconds(10));
 
@@ -133,6 +166,7 @@ public partial class App : Application
 
         desktop.Exit += (_, _) =>
         {
+            UiZoom.Flush();
             watchdog.Dispose();
             AppHost.Get<MemoryTrimmer>().Dispose();
             AppHost.Get<TriggerService>().Dispose();
@@ -140,7 +174,27 @@ public partial class App : Application
             AppHost.Get<WatchFolderService>().DisposeAsync().AsTask().Wait(TimeSpan.FromSeconds(5));
         };
 
+        // Before HandleCommandLine marks the first run complete: a fresh install gets no slides (an update by the
+        // installer does, even when its settings are gone). Without the main window (sign-in, the Explorer menu) they
+        // wait until the user opens Filee, unless the installer asked for them.
+        AppHost.Get<WhatsNewService>().CheckAtStartup(
+            background: Program.Options.Background && !Program.Options.ShowSettings && !Program.Options.WhatsNew
+                        || Program.Options.ConvertFiles.Count > 0,
+            updated: Program.Options.WhatsNew, updatedFrom: Program.Options.UpdatedFrom);
         HandleCommandLine(Program.Options, firstLaunch: true);
+        if (OperatingSystem.IsMacOS())
+            this.TryGetFeature<IActivatableLifetime>()?.Activated += (_, e) =>
+            {
+                if (e.Kind == ActivationKind.Reopen)
+                    Dispatcher.UIThread.Post(() =>
+                    {
+                        // Clicking the Dock icon or opening Filee again in Finder brings the window back, as Mac apps do
+                        // (#232), also while it only runs in the background.
+                        AppHost.Get<WindowService>().ShowMain(store.Settings.FirstRunCompleted ? null : "home");
+                        if (!store.Settings.ShowInDock && !platform.TrySetShowInDock(false))
+                            log.LogWarning("Could not restore the macOS Dock visibility policy after reopening Filee");
+                    });
+            };
         WatchForUpdates(store);
         // Filee runs as administrator while Explorer doesn't (an installer started "as administrator" started it):
         // say so once, next to the tray, and on the Home page for as long as it lasts.
@@ -166,6 +220,7 @@ public partial class App : Application
     private static void WatchForUpdates(UserDataStore store)
     {
         var updates = AppHost.Get<UpdateService>();
+        updates.RequestApplicationShutdown = Quit;
         // Required: the card every time Filee starts (UpdateFound fires once per run). Recommended: once per version.
         // Optional: no card, the sidebar button only. Frequent releases no longer ask every day.
         updates.UpdateFound += (_, version) =>
@@ -178,6 +233,9 @@ public partial class App : Application
             AppHost.Get<WindowService>().ShowUpdateNotice(version);
         };
         updates.UpdateFailed += async (_, _) => await AppHost.Get<WindowService>().ShowUpdateFailedAsync();
+        // The last run's update failed after Filee closed (Linux): the installer rolled back and started this copy.
+        if (updates.CheckPendingFailure(store.Directory))
+            Dispatcher.UIThread.Post(async () => await AppHost.Get<WindowService>().ShowUpdateRolledBackAsync(updates.LastFailureLogPath));
         updates.StartPeriodicChecks(() => store.Settings.CheckForUpdates, TimeSpan.FromSeconds(20));
         DispatcherTimer.RunOnce(() => NotifyEngineUpdates(store), TimeSpan.FromSeconds(25));
     }
@@ -221,7 +279,8 @@ public partial class App : Application
         if (loc.NeedsUpdate(settings.Language))
             loc.SetLanguage(settings.Language);
 
-        AppHost.Get<ThemeService>().Apply(settings.Theme, loc.Language);
+        var custom = CustomTheme.Load(AppHost.Get<UserDataStore>().Directory, AppHost.Get<ILogger<App>>());
+        AppHost.Get<ThemeService>().Apply(settings.Theme, loc.Language, custom);
         AppHost.Get<TriggerService>().Apply(settings);
         AppHost.Get<ConverterCatalog>().Priority = settings.EnginePriority;
         if (ownCopiesChanged || routesChanged)
@@ -282,17 +341,21 @@ public partial class App : Application
     }
 
     /// <summary>
-    /// Options ticked on the installer's task page. Saving applies them through SystemIntegrationService
-    /// as if they had been switched on the General page.
+    /// Options ticked in Setup, and the language picked there. Saving applies them (SystemIntegrationService, the
+    /// language) as if they had been switched on the General page.
     /// </summary>
     private static void ApplyInstallerChoices(CommandLine options, UserDataStore store)
     {
-        if (options.StartWithWindows is null && options.ContextMenu is null)
+        // Only Filee's languages; anything else keeps the setting (normally "auto", Windows' language).
+        var language = LocalizationService.Languages.FirstOrDefault(l => l.Code.Equals(options.Language, StringComparison.OrdinalIgnoreCase)).Code;
+        if (options.StartWithWindows is null && options.ContextMenu is null && language is null)
             return;
         if (options.StartWithWindows is { } start)
             store.Settings.StartWithSystem = start;
         if (options.ContextMenu is { } menu)
             store.Settings.ContextMenuEnabled = menu;
+        if (language is not null)
+            store.Settings.Language = language;
         store.SaveSettings();
     }
 
@@ -303,7 +366,7 @@ public partial class App : Application
         var (x, y) = AppHost.Get<TriggerService>().LastCursor;
         if (x == 0 && y == 0 && AppHost.Get<WindowService>().Main is { } main)
             (x, y) = (main.Position.X + 200, main.Position.Y + 200);
-        AppHost.Get<RadialController>().ShowForFiles(x, y, files);
+        AppHost.Get<RadialController>().ShowForFiles(x, y, files, forAnotherProcess: true);
     }
 
 }

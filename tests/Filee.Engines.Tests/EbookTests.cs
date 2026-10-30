@@ -117,6 +117,31 @@ public class EbookTests(EngineFixture fx) : IClassFixture<EngineFixture>
     // ───────────────────────── EPUB ─────────────────────────
 
     [Fact]
+    public void Book_chapters_only_include_images_from_the_unpacked_book()
+    {
+        var folder = fx.NewFolder();
+        var book = Path.Combine(folder, "book");
+        var chapterFolder = Path.Combine(book, "Text");
+        var imageFolder = Path.Combine(book, "Images");
+        Directory.CreateDirectory(chapterFolder);
+        Directory.CreateDirectory(imageFolder);
+        var inside = Path.Combine(imageFolder, "inside.png");
+        var outside = Path.Combine(folder, "private.png");
+        var sibling = Path.Combine(folder, "book-evil", "sibling.png"); // shares the "book" prefix
+        Directory.CreateDirectory(Path.GetDirectoryName(sibling)!);
+        File.WriteAllBytes(inside, EbookBuilders.Png(4, 4, MagickColors.Teal));
+        File.WriteAllBytes(outside, EbookBuilders.Png(4, 4, MagickColors.Red));
+        File.WriteAllBytes(sibling, EbookBuilders.Png(4, 4, MagickColors.Red));
+        var chapter = Path.Combine(chapterFolder, "chapter.xhtml");
+        File.WriteAllText(chapter, $"""
+            <html><body><p><img src="../Images/inside.png"><img src="../../private.png"><img src="../../book-evil/sibling.png"><img src="{new Uri(outside).AbsoluteUri}"></p></body></html>
+            """);
+
+        var document = ChapterReader.Read([chapter], Path.Combine(book, "~media"), TestContext.Current.CancellationToken);
+        Assert.Equal(inside, Assert.Single(Hwp.Hwpx.HDocumentWalker.Images(document)).Path);
+    }
+
+    [Fact]
     public void Epub_reader_keeps_chapters_links_pictures_and_metadata()
     {
         var book = EpubReader.ReadBook(EbookBuilders.Epub(fx.NewFolder()), fx.NewFolder(), TestContext.Current.CancellationToken);
@@ -170,6 +195,33 @@ public class EbookTests(EngineFixture fx) : IClassFixture<EngineFixture>
         Assert.Contains("| 이름 | 값 |", markdown);
         var picture = System.Text.RegularExpressions.Regex.Match(markdown, @"!\[\]\(<([^>]+)>\)").Groups[1].Value;
         Assert.True(File.Exists(Path.Combine(Path.GetDirectoryName(md)!, Uri.UnescapeDataString(picture))));
+
+        var textOnly = await fx.ConvertAsync([epub], new Preset { TargetFormat = "md", Document = { LeaveOutPictures = true } });
+        var withoutPictures = await File.ReadAllTextAsync(textOnly.Outputs.Single(), TestContext.Current.CancellationToken);
+        Assert.Contains("# 첫 번째 장", withoutPictures);
+        Assert.DoesNotContain("![", withoutPictures);
+    }
+
+    [Theory]
+    [InlineData(0x41u)]
+    [InlineData(0x40u)]
+    public async Task Markdown_dds_picture_keeps_its_colours_in_epub(uint flags)
+    {
+        var dir = fx.NewFolder();
+        byte[] pixels = [.. Enumerable.Repeat<byte[]>([255, 0, 0, 255], 16).SelectMany(p => p)];
+        File.WriteAllBytes(Path.Combine(dir, "red.dds"), ImageFormatTests.Dds(flags, 0xFF, 0xFF00, 0xFF0000, 0xFF000000, pixels));
+        var md = Path.Combine(dir, "book.md");
+        await File.WriteAllTextAsync(md, "![red](red.dds)", TestContext.Current.CancellationToken);
+
+        var epub = await ConvertAsync(md, "epub");
+
+        using var zip = ZipFile.OpenRead(epub);
+        using var stream = Assert.Single(zip.Entries, e => e.FullName.StartsWith("OEBPS/images/", StringComparison.Ordinal)
+            && e.FullName.EndsWith(".png", StringComparison.Ordinal)).Open();
+        using var image = new MagickImage(stream);
+        Assert.Equal(MagickFormat.Png, image.Format);
+        Assert.Equal((4u, 4u), (image.Width, image.Height));
+        Assert.Equal(pixels.Where((_, i) => i % 4 != 3).ToArray(), image.GetPixels().ToByteArray(PixelMapping.RGB));
     }
 
     [Fact]
@@ -378,6 +430,26 @@ public class EbookTests(EngineFixture fx) : IClassFixture<EngineFixture>
     // ───────────────────────── HTMLZ / TXTZ ─────────────────────────
 
     [Fact]
+    public void Txtz_only_includes_images_from_the_unpacked_book()
+    {
+        var folder = fx.NewFolder();
+        var outside = Path.Combine(folder, "private.png");
+        File.WriteAllBytes(outside, EbookBuilders.Png(4, 4, MagickColors.Red));
+        var txtz = Path.Combine(folder, "book.txtz");
+        using (var zip = ZipFile.Open(txtz, ZipArchiveMode.Create))
+        {
+            using (var writer = new StreamWriter(zip.CreateEntry("index.txt").Open()))
+                writer.Write($"![](images/inside.png) ![](../private.png) ![]({new Uri(outside).AbsoluteUri})");
+            using var image = zip.CreateEntry("images/inside.png").Open();
+            image.Write(EbookBuilders.Png(4, 4, MagickColors.Teal));
+        }
+
+        var book = ZippedText.ReadTxtzBook(txtz, folder); // unpacked next to private.png
+        var image1 = Assert.Single(Hwp.Hwpx.HDocumentWalker.Images(book.Document));
+        Assert.EndsWith(Path.Combine("images", "inside.png"), image1.Path);
+    }
+
+    [Fact]
     public async Task Htmlz_and_txtz_are_written_and_read()
     {
         var epub = EbookBuilders.Epub(fx.NewFolder());
@@ -415,6 +487,22 @@ public class EbookTests(EngineFixture fx) : IClassFixture<EngineFixture>
             for (var i = 0; i < document.PageCount; i++)
                 Assert.Equal(EbookBuilders.ComicPages[i].Width * 72.0 / 96, document.Pages[i].Width.Point, 1);
         }
+    }
+
+    [Fact]
+    public async Task A_comic_with_black_and_white_pages_becomes_a_pdf()
+    {
+        // #605: PNG pages go into the PDF as they are, and PDFsharp refuses a 1-bit PNG.
+        var dir = fx.NewFolder();
+        var cbz = Path.Combine(dir, "scans.cbz");
+        using (var zip = ZipFile.Open(cbz, ZipArchiveMode.Create))
+        {
+            zip.CreateEntryFromFile(ImageAndPdfTests.MakeScan(dir, "page1.png"), "page1.png");
+            zip.CreateEntryFromFile(ImageAndPdfTests.MakeScan(dir, "page2.png", "16", "2"), "page2.png");
+        }
+
+        using var document = PdfReader.Open(await ConvertAsync(cbz, "pdf"), PdfDocumentOpenMode.Import);
+        Assert.Equal(2, document.PageCount);
     }
 
     [Fact]
